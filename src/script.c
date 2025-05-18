@@ -6,12 +6,12 @@
  * terms of the GNU General Public License as published by the Free Software
  * Foundation, either version 3 of the License, or (at your option) any later
  * version.
-
+ *
  * Goxel is distributed in the hope that it will be useful, but WITHOUT ANY
  * WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
  * FOR A PARTICULAR PURPOSE.  See the GNU General Public License for more
  * details.
-
+ *
  * You should have received a copy of the GNU General Public License along with
  * goxel.  If not, see <http://www.gnu.org/licenses/>.
  */
@@ -252,7 +252,7 @@ static klass_t vec_klass = {
         {"b", .get=js_vec_get, .set=js_vec_set, .magic=2},
         {"a", .get=js_vec_get, .set=js_vec_set, .magic=3},
         {}
-    },
+    }
 };
 
 static JSValue js_box_from_ptr(
@@ -499,16 +499,8 @@ static klass_t image_klass = {
     }
 };
 
-static void js_layer_finalizer(JSRuntime *ctx, JSValue this_val)
-{
-    layer_t *layer;
-    layer = JS_GetOpaque(this_val, layer_klass.id);
-    layer_delete(layer);
-}
-
 static klass_t layer_klass = {
     .def.class_name = "Layer",
-    .def.finalizer = js_layer_finalizer,
     .attributes = {
         {"volume", .klass=&volume_klass, MEMBER(layer_t, volume)},
         {}
@@ -516,105 +508,59 @@ static klass_t layer_klass = {
 };
 
 typedef struct {
-    file_format_t format;
-    JSValue data;
-} script_file_format_t;
+    const char *name;
+    JSValue execute_fn;
+} script_t;
 
-int script_format_import_func(const file_format_t *format_, image_t *image,
-                              const char *path)
+// stb array of registered scripts
+static script_t *g_scripts = NULL;
+
+static JSValue js_file_format_register(JSContext *ctx, JSValueConst this_val,
+                                      int argc, JSValueConst *argv)
 {
-    JSContext *ctx = g_ctx;
-    const script_file_format_t *format = (void*)format_;
-    JSValue js_import, js_image, js_path, val;
-    JSValueConst argv[2];
-    js_image = JS_NewObjectClass(ctx, image_klass.id);
-    goxel.image->ref++;
-    JS_SetOpaque(js_image, (void*)goxel.image);
-    js_path = JS_NewString(ctx, path);
-    argv[0] = js_image;
-    argv[1] = js_path;
-    js_import = JS_GetPropertyStr(ctx, format->data, "import");
-    val = JS_Call(ctx, js_import, JS_NULL, 2, argv);
-    JS_FreeValue(ctx, val);
-    JS_FreeValue(ctx, js_import);
-    JS_FreeValue(ctx, js_image);
-    JS_FreeValue(ctx, js_path);
-    return 0;
-}
+    const char *name;
+    JSValue data, import_fn, export_fn;
+    file_format_t f = {};
 
-int script_format_export_func(const file_format_t *format_,
-                              const image_t *img, const char *path)
-{
-    JSContext *ctx = g_ctx;
-    const script_file_format_t *format = (void*)format_;
-    JSValue export, image;
-    JSValueConst argv[2];
-
-    image = JS_NewObjectClass(ctx, image_klass.id);
-    goxel.image->ref++;
-    JS_SetOpaque(image, (void*)goxel.image);
-    argv[0] = image;
-    argv[1] = JS_NewString(ctx, path);
-    export = JS_GetPropertyStr(ctx, format->data, "export");
-    JS_Call(ctx, export, JS_NULL, 2, argv);
-    return 0;
-}
-
-static JSValue js_goxel_registerFormat(JSContext *ctx, JSValueConst this_val,
-                                       int argc, JSValueConst *argv)
-{
-    const char *name, *ext;
-    JSValueConst args;
-    JSValue val, ext_val;
-    script_file_format_t *format;
-    uint32_t idx;
-
-    args = argv[0];
-    name = JS_ToCString(ctx, JS_GetPropertyStr(ctx, args, "name"));
-
-    LOG_I("Register format %s", name);
-    format = calloc(1, sizeof(*format));
-    *format = (script_file_format_t) {
-        .format = {
-            .name = name,
-        },
-        .data = JS_DupValue(ctx, args),
-    };
-
-    val = JS_GetPropertyStr(ctx, args, "exts");
-    if (JS_IsArray(ctx, val)) {
-        for (idx = 0; idx < ARRAY_SIZE(format->format.exts); idx++) {
-            ext_val = JS_GetPropertyUint32(ctx, val, idx);
-            ext = JS_ToCString(ctx, ext_val);
-            format->format.exts[idx] = ext;
-        }
+    if (argc != 1) return JS_EXCEPTION;
+    data = argv[0];
+    name = JS_GetPropertyStr(ctx, data, "name");
+    name = JS_ToCString(ctx, name);
+    if (!name) return JS_EXCEPTION;
+    snprintf(f.name, sizeof(f.name), "%s", name);
+    f.import_func = NULL;
+    f.export_func = NULL;
+    import_fn = JS_GetPropertyStr(ctx, data, "import");
+    if (!JS_IsUndefined(import_fn)) {
+        f.import_func = js_file_format_import;
+        JS_DupValue(ctx, import_fn);
+        hmput(g_file_format_import_funcs, f.name, import_fn);
     }
-    JS_FreeValue(ctx, val);
-
-    val = JS_GetPropertyStr(ctx, args, "import");
-    if (!JS_IsUndefined(val))
-        format->format.import_func = script_format_import_func;
-    JS_FreeValue(ctx, val);
-
-    val = JS_GetPropertyStr(ctx, args, "export");
-    if (!JS_IsUndefined(val))
-        format->format.export_func = script_format_export_func;
-    JS_FreeValue(ctx, val);
-
-    file_format_register(&format->format);
+    export_fn = JS_GetPropertyStr(ctx, data, "export");
+    if (!JS_IsUndefined(export_fn)) {
+        f.export_func = js_file_format_export;
+        JS_DupValue(ctx, export_fn);
+        hmput(g_file_format_export_funcs, f.name, export_fn);
+    }
+    file_format_register(&f);
+    JS_FreeCString(ctx, name);
     return JS_UNDEFINED;
 }
 
-static JSValue js_goxel_registerScript(JSContext *ctx, JSValueConst this_val,
-                                       int argc, JSValueConst *argv)
+static JSValue js_script_register(JSContext *ctx, JSValueConst this_val,
+                                      int argc, JSValueConst *argv)
 {
-    JSValueConst data;
+    const char *name, *description;
+    JSValue data;
     script_t script = {};
-    const char *name;
 
+    if (argc != 1) return JS_EXCEPTION;
     data = argv[0];
-    name = JS_ToCString(ctx, JS_GetPropertyStr(ctx, data, "name"));
-    LOG_I("Register script %s", name);
+    name = JS_GetPropertyStr(ctx, data, "name");
+    name = JS_ToCString(ctx, name);
+    if (!name) return JS_EXCEPTION;
+    description = JS_GetPropertyStr(ctx, data, "description");
+    description = JS_ToCString(ctx, description);
     snprintf(script.name, sizeof(script.name), "%s", name);
     script.execute_fn = JS_GetPropertyStr(ctx, data, "onExecute");
     arrput(g_scripts, script);
@@ -622,217 +568,121 @@ static JSValue js_goxel_registerScript(JSContext *ctx, JSValueConst this_val,
     return JS_UNDEFINED;
 }
 
+static JSValue js_goxel_version(JSContext *ctx, JSValueConst this_val, int magic)
+{
+    return JS_NewString(ctx, GOXEL_VERSION);
+}
+
 static klass_t goxel_klass = {
     .def.class_name = "Goxel",
     .attributes = {
-        {"image", .klass=&image_klass, MEMBER(goxel_t, image)},
-        {"registerFormat", .fn=js_goxel_registerFormat},
-        {"registerScript", .fn=js_goxel_registerScript},
-        {}
-    },
+        {"registerFormat", .fn=js_file_format_register},
+        {"registerScript", .fn=js_script_register},
+        {"image", .klass=&image_klass},
+        {"version", .get=js_goxel_version},
+    }
 };
 
-static JSValue attr_getter(JSContext *ctx, JSValueConst this_val, int magic)
+static JSValue js_palette_get_color(JSContext *ctx, JSValueConst this_val, int magic)
 {
-    JSValue proto, ret;
-    const klass_t *klass;
-    void *this, *ptr;
-    const attribute_t *attr;
-
-    proto = JS_GetPrototype(ctx, this_val);
-    klass = JS_GetOpaque(proto, 1);
-    this = JS_GetOpaque(this_val, klass->id);
-    JS_FreeValue(ctx, proto);
-    attr = &klass->attributes[magic];
-
-    assert(this);
-    if (attr->klass && attr->klass->ctor_from_ptr && attr->member.size) {
-        ptr = this + attr->member.offset;
-        ret = attr->klass->ctor_from_ptr(ctx, this_val, ptr, attr->member.size);
-        return ret;
-    }
-
-    if (attr->klass && attr->member.size) {
-        ptr = *(void**)(this + attr->member.offset);
-        if (!ptr) return JS_NULL;
-        ((obj_t*)ptr)->ref++;
-        ret = JS_NewObjectClass(ctx, attr->klass->id);
-        JS_SetOpaque(ret, ptr);
-        return ret;
-    }
-
-    return JS_EXCEPTION;
+    uint8_t *color = goxel.painter.color;
+    return new_js_vec4(ctx, color[0], color[1], color[2], color[3]);
 }
 
-static JSValue attr_setter(JSContext *ctx, JSValueConst this_val,
-                           JSValueConst val, int magic)
-{
-    // Not implemented yet.
-    return JS_EXCEPTION;
-}
-
-static void init_klass(JSContext *ctx, klass_t *klass)
-{
-    JSValue proto, getter, setter, obj_class, global_obj;
-    attribute_t *attr;
-    int i;
-    JSAtom name;
-
-    JS_NewClassID(&klass->id);
-    JS_NewClass(JS_GetRuntime(ctx), klass->id, &klass->def);
-    proto = JS_NewObject(ctx);
-    JS_SetOpaque(proto, klass);
-    JS_SetClassProto(ctx, klass->id, proto);
-
-    if (klass->ctor) {
-        obj_class = JS_NewCFunction2(ctx, klass->ctor, klass->def.class_name, 0,
-                                     JS_CFUNC_constructor, 0);
-        JS_SetConstructor(ctx, obj_class, proto);
-        global_obj = JS_GetGlobalObject(ctx);
-        JS_SetPropertyStr(ctx, global_obj, klass->def.class_name, obj_class);
-        JS_FreeValue(ctx, global_obj);
+static klass_t palette_klass = {
+    .def.class_name = "Palette",
+    .attributes = {
+        {"color", .get=js_palette_get_color},
+        {}
     }
+};
 
-    for (i = 0, attr = &klass->attributes[0]; attr->name; attr++, i++) {
-        name = JS_NewAtom(ctx, attr->name);
-        if (attr->get) {
-            getter = JS_NewCFunction2(ctx, (void*)attr->get, NULL, 0,
-                                      JS_CFUNC_getter_magic, attr->magic);
-            setter = JS_NewCFunction2(ctx, (void*)attr->set, NULL, 0,
-                                      JS_CFUNC_setter_magic, attr->magic);
-            JS_DefinePropertyGetSet(ctx, proto, name, getter, setter, 0);
-        } else if (attr->fn) {
-            JS_DefinePropertyValue(ctx, proto, name,
-                           JS_NewCFunction(ctx, attr->fn, NULL, 0),
-                           JS_DEF_CFUNC);
-        } else {
-            getter = JS_NewCFunction2(ctx, (void*)attr_getter, NULL, 0,
-                                      JS_CFUNC_getter_magic, i);
-            setter = JS_NewCFunction2(ctx, (void*)attr_setter, NULL, 0,
-                                      JS_CFUNC_setter_magic, i);
-            JS_DefinePropertyGetSet(ctx, proto, name, getter, setter, 0);
-        }
-    }
-}
-
-static void init_runtime(void)
+static void on_script(const char *path, const char *data, int size, void *user)
 {
-    JSContext *ctx;
-    JSValue obj, global_obj;
+    JSValue val, func;
+    int err;
 
-    if (g_ctx) return;
-    g_rt = JS_NewRuntime();
-    g_ctx = JS_NewContext(g_rt);
-    ctx = g_ctx;
-    js_init_module_std(ctx, "std");
-    js_init_module_os(ctx, "os");
-
-    init_klass(ctx, &vec_klass);
-    init_klass(ctx, &box_klass);
-    init_klass(ctx, &volume_klass);
-    init_klass(ctx, &layer_klass);
-    init_klass(ctx, &image_klass);
-    init_klass(ctx, &goxel_klass);
-
-    // Add global 'goxel' object.
-    obj = JS_NewObjectClass(ctx, goxel_klass.id);
-    JS_SetOpaque(obj, &goxel);
-    global_obj = JS_GetGlobalObject(ctx);
-    JS_SetPropertyStr(ctx, global_obj, "goxel", obj);
-    JS_FreeValue(ctx, global_obj);
-}
-
-static int script_run_from_str(
-        const char *script, int len, const char *filename, int argc,
-        const char **argv)
-{
-    int ret = 0;
-    JSValue val;
-
-    init_runtime();
-    js_std_add_helpers(g_ctx, argc, (char**)argv);
-
-    val = JS_Eval(g_ctx, script, len, filename, JS_EVAL_TYPE_MODULE);
+    val = JS_Eval(g_ctx, data, size, path, JS_EVAL_TYPE_GLOBAL);
     if (JS_IsException(val)) {
         js_std_dump_error(g_ctx);
-        ret = -1;
+        return;
     }
     JS_FreeValue(g_ctx, val);
-    return ret;
 }
 
-int script_run_from_file(const char *filename, int argc, const char **argv)
+static void on_dir(const char *path, void *user)
 {
-    char *script;
-    int ret, size;
-
-    script = read_file(filename, &size);
-    if (!script) {
-        fprintf(stderr, "Cannot read '%s'\n", filename);
-        return -1;
-    }
-
-    ret = script_run_from_str(script, size, filename, argc, argv);
-    free(script);
-    return ret;
+    assets_list(path, NULL, on_script);
 }
 
-static int on_script(int i, const char *path, void *user)
+int script_init(void)
 {
-    const char *data;
+    JSValue global_obj, obj, obj_class;
+    const char *str;
 
-    LOG_D("Run script %s", path);
-    data = assets_get(path, NULL);
-    script_run_from_str(data, strlen(data), path, 0, NULL);
-    return 0;
-}
+    g_rt = JS_NewRuntime();
+    g_ctx = JS_NewContext(g_rt);
 
-static int on_user_script(const char *dir, const char *name, void *user)
-{
-    char path[1024];
-    char *data;
-    int size;
+    /* loader for ES6 modules */
+    js_std_init_handlers(g_rt);
+    /* setmodule loader base name */
+    str = ".";
+    JS_SetModuleLoader(g_rt, NULL, js_module_loader, str);
+    js_std_add_helpers(g_ctx);
 
-    snprintf(path, sizeof(path), "%s/%s", dir, name);
-    data = read_file(path, &size);
-    if (!data) return -1;
-    script_run_from_str(data, strlen(data), path, 0, NULL);
-    return 0;
-}
+    /* system functions */
+    global_obj = JS_GetGlobalObject(g_ctx);
+    JS_SetPropertyStr(g_ctx, global_obj, "std", js_std_new_namespace(g_ctx));
+    JS_FreeValue(g_ctx, global_obj);
 
-static int on_dir(void *arg, const char *path)
-{
-    LOG_I("Loading scripts from %s\n", path);
-    sys_list_dir(path, on_user_script, NULL);
-    return 0;
-}
+    /* add goxel object */
+    obj = JS_NewObjectClass(g_ctx, goxel_klass.id);
+    JS_SetOpaque(obj, &goxel);
+    obj_class = JS_NewClass(g_rt, goxel_klass.id, &goxel_klass.def);
+    global_obj = JS_GetGlobalObject(g_ctx);
+    JS_SetPropertyStr(g_ctx, global_obj, goxel_klass.def.class_name, obj_class);
+    JS_FreeValue(g_ctx, global_obj);
 
-void script_init(void)
-{
+    global_obj = JS_GetGlobalObject(g_ctx);
+    JS_SetPropertyStr(g_ctx, global_obj, "goxel", obj);
+    JS_FreeValue(g_ctx, global_obj);
+
+    JS_FreeValue(g_ctx, obj);
+    JS_FreeValue(g_ctx, obj_class);
+
+    /* add vec object */
+    obj_class = JS_NewClass(g_rt, vec_klass.id, &vec_klass.def);
+    JS_SetClassProto(g_ctx, vec_klass.id,
+                     JS_NewCFunction(g_ctx, vec_klass.ctor, vec_klass.def.class_name, 0));
+    JS_FreeValue(g_ctx, obj_class);
+
+    /* add box object */
+    obj_class = JS_NewClass(g_rt, box_klass.id, &box_klass.def);
+    JS_FreeValue(g_ctx, obj_class);
+
+    /* add image object */
+    obj_class = JS_NewClass(g_rt, image_klass.id, &image_klass.def);
+    JS_FreeValue(g_ctx, obj_class);
+
+    /* add layer object */
+    obj_class = JS_NewClass(g_rt, layer_klass.id, &layer_klass.def);
+    JS_FreeValue(g_ctx, obj_class);
+
+    /* add volume object */
+    obj_class = JS_NewClass(g_rt, volume_klass.id, &volume_klass.def);
+    JS_SetClassProto(g_ctx, volume_klass.id,
+                     JS_NewCFunction(g_ctx, volume_klass.ctor, volume_klass.def.class_name, 0));
+    JS_FreeValue(g_ctx, obj_class);
+
     assets_list("data/scripts/", NULL, on_script);
     sys_iter_paths(SYS_LOCATION_CONFIG, SYS_DIR, "scripts", NULL, on_dir);
-}
-
-void script_release(void)
-{
-    JS_FreeContext(g_ctx);
-    JS_FreeRuntime(g_rt);
-}
-
-void script_iter_all(void *user, void (*f)(void *user, const char *name))
-{
-    int i;
-    for (i = 0; i < arrlen(g_scripts); i++) {
-        f(user, g_scripts[i].name);
-    }
+    return 0;
 }
 
 int script_execute(const char *name)
 {
     int i;
-    int ret = 0;
-    script_t *script = NULL;
-    JSContext *ctx = g_ctx;
+    script_t *script;
     JSValue val;
 
     for (i = 0; i < arrlen(g_scripts); i++) {
@@ -841,14 +691,103 @@ int script_execute(const char *name)
     }
     if (i == arrlen(g_scripts)) return -1;
     assert(script);
-
-    LOG_I("Run script %s", name);
-    val = JS_Call(ctx, script->execute_fn, JS_UNDEFINED, 0, NULL);
+    val = JS_Call(g_ctx, script->execute_fn, JS_UNDEFINED, 0, NULL);
     if (JS_IsException(val)) {
-        LOG_E("Error executing script");
-        js_std_dump_error(ctx);
-        ret = -1;
+        js_std_dump_error(g_ctx);
     }
-    JS_FreeValue(ctx, val);
-    return ret;
+    JS_FreeValue(g_ctx, val);
+    return 0;
 }
+
+int script_close(void)
+{
+    int i;
+    for (i = 0; i < arrlen(g_scripts); i++) {
+        JS_FreeValue(g_ctx, g_scripts[i].execute_fn);
+    }
+    arrfree(g_scripts);
+    JS_FreeContext(g_ctx);
+    JS_FreeRuntime(g_rt);
+    return 0;
+}
+
+static JSValue js_file_format_register(JSContext *ctx, JSValueConst this_val,
+                                      int argc, JSValueConst *argv)
+{
+    const char *name;
+    JSValue data, import_fn, export_fn;
+    file_format_t f = {};
+
+    if (argc != 1) return JS_EXCEPTION;
+    data = argv[0];
+    name = JS_GetPropertyStr(ctx, data, "name");
+    name = JS_ToCString(ctx, name);
+    if (!name) return JS_EXCEPTION;
+    snprintf(f.name, sizeof(f.name), "%s", name);
+    f.import_func = NULL;
+    f.export_func = NULL;
+    import_fn = JS_GetPropertyStr(ctx, data, "import");
+    if (!JS_IsUndefined(import_fn)) {
+        f.import_func = js_file_format_import;
+        JS_DupValue(ctx, import_fn);
+        hmput(g_file_format_import_funcs, f.name, import_fn);
+    }
+    export_fn = JS_GetPropertyStr(ctx, data, "export");
+    if (!JS_IsUndefined(export_fn)) {
+        f.export_func = js_file_format_export;
+        JS_DupValue(ctx, export_fn);
+        hmput(g_file_format_export_funcs, f.name, export_fn);
+    }
+    file_format_register(&f);
+    JS_FreeCString(ctx, name);
+    return JS_UNDEFINED;
+}
+static JSValue js_script_register(JSContext *ctx, JSValueConst this_val,
+                                      int argc, JSValueConst *argv)
+{
+    const char *name, *description;
+    JSValue data;
+    script_t script = {};
+
+    if (argc != 1) return JS_EXCEPTION;
+    data = argv[0];
+    name = JS_GetPropertyStr(ctx, data, "name");
+    name = JS_ToCString(ctx, name);
+    if (!name) return JS_EXCEPTION;
+    description = JS_GetPropertyStr(ctx, data, "description");
+    description = JS_ToCString(ctx, description);
+    snprintf(script.name, sizeof(script.name), "%s", name);
+    script.execute_fn = JS_GetPropertyStr(ctx, data, "onExecute");
+    arrput(g_scripts, script);
+    JS_FreeCString(ctx, name);
+    return JS_UNDEFINED;
+}
+static JSValue js_goxel_version(JSContext *ctx, JSValueConst this_val, int magic)
+{
+    return JS_NewString(ctx, GOXEL_VERSION);
+}
+static JSValue js_palette_get_color(JSContext *ctx, JSValueConst this_val, int magic)
+{
+    uint8_t *color = goxel.painter.color;
+    return new_js_vec4(ctx, color[0], color[1], color[2], color[3]);
+}
+
+static klass_t palette_klass = {
+    .def.class_name = "Palette",
+    .attributes = {
+        {"color", .get=js_palette_get_color},
+        {}
+    }
+};
+
+static klass_t goxel_klass = {
+    .def.class_name = "Goxel",
+    .attributes = {
+        {"registerFormat", .fn=js_file_format_register},
+        {"registerScript", .fn=js_script_register},
+        {"image", .klass=&image_klass},
+        {"version", .get=js_goxel_version},
+        {"palette", .klass=&palette_klass},
+        {}
+    }
+};
